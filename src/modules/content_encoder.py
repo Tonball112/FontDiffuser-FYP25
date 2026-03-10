@@ -1,4 +1,5 @@
 # This script is provided by authors of FontDiffuser.
+# Modified by FYP2505 to include CASD (Spatial Transformer Network)
 
 import functools
 
@@ -411,6 +412,48 @@ def content_encoder_arch(ch=64, out_channel_multiplier=1, input_nc=3):
     return arch
 
 
+class SpatialTransformer(nn.Module):
+    """
+    CASD Module: Content-Aware Style Deformation (Spatial Transformer Network)
+    Learns to predict geometric offsets to deform the standard font skeleton
+    into the cursive rhythm of the calligraphic target.
+    """
+    def __init__(self, in_channels, resolution):
+        super(SpatialTransformer, self).__init__()
+        
+        self.localization = nn.Sequential(
+            nn.Conv2d(in_channels, 8, kernel_size=7, padding=3),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(8, 10, kernel_size=5, padding=2),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True)
+        )
+        
+        fc_size = 10 * (resolution // 4) * (resolution // 4)
+
+        self.fc_loc = nn.Sequential(
+            nn.Linear(fc_size, 32),
+            nn.ReLU(True),
+            nn.Linear(32, 3 * 2)
+        )
+
+        self.fc_loc[2].weight.data.zero_()
+        self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
+
+    def forward(self, x):
+        xs = self.localization(x)
+        xs = xs.view(xs.size(0), -1)
+        
+        theta = self.fc_loc(xs)
+        theta = theta.view(-1, 2, 3)
+
+        grid = F.affine_grid(theta, x.size(), align_corners=False)
+        x_warped = F.grid_sample(x, grid, align_corners=False)
+        
+        return x_warped
+
+
 class ContentEncoder(ModelMixin, ConfigMixin):
 
     @register_to_config
@@ -448,6 +491,8 @@ class ContentEncoder(ModelMixin, ConfigMixin):
         self.G_param = G_param
         self.SN_eps = SN_eps
         self.fp16 = G_fp16
+
+        self.stn = SpatialTransformer(in_channels=input_nc, resolution=self.resolution)
 
         if self.resolution == 96:
             self.save_featrues = [0, 1, 2, 3, 4]
@@ -517,7 +562,9 @@ class ContentEncoder(ModelMixin, ConfigMixin):
         print("Param count for D" "s initialized parameters: %d" % self.param_count)
 
     def forward(self, x):
-        h = x
+        x_deformed = self.stn(x)
+        h = x_deformed
+        
         residual_features = []
         residual_features.append(h)
         for index, blocklist in enumerate(self.blocks):
