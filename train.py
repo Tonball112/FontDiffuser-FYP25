@@ -323,10 +323,30 @@ def main():
             device=target_images.device,
         )
 
+        # We use a differentiable morphological gradient to approximate the character skeleton
+        def extract_skeleton(img_tensor):
+            # Dilation (thickens the ink strokes) via Max Pooling
+            dilated = F.max_pool2d(img_tensor, kernel_size=3, stride=1, padding=1)
+            # Erosion (thins the ink strokes) via negative Max Pooling
+            eroded = -F.max_pool2d(-img_tensor, kernel_size=3, stride=1, padding=1)
+            # The difference isolates the structural skeleton/edges of the calligraphy
+            return dilated - eroded
+        
+        # Extract skeletons from both the generated prediction and the ground truth
+        pred_skeleton = extract_skeleton(pred_original_sample)
+        target_skeleton = extract_skeleton(nonorm_target_images)
+        
+        # Calculate the L1 distance between the predicted bones and the real bones
+        structural_loss = F.l1_loss(pred_skeleton, target_skeleton)
+        
+        # We use getattr in case you haven't added this argument to your config parser yet
+        structural_coefficient = getattr(args, 'structural_coefficient', 0.5)
+
         loss = (
             diff_loss
             + args.perceptual_coefficient * percep_loss
             + args.offset_coefficient * offset_loss
+            + structural_coefficient * structural_loss 
         )
 
         if args.use_scr:
