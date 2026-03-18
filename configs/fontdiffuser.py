@@ -111,6 +111,7 @@ def get_parser():
     ## loss coefficient
     parser.add_argument("--perceptual_coefficient", type=float, default=0.01)
     parser.add_argument("--offset_coefficient", type=float, default=0.5)
+    parser.add_argument("--structural_coefficient", type=float, default=0.5)
     ## step
     parser.add_argument(
         "--max_train_steps",
