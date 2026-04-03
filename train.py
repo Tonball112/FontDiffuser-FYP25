@@ -14,6 +14,7 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from diffusers.optimization import get_scheduler
+from diffusers.models.attention_processor import LoRAAttnProcessor # Added LoRA Import
 from tqdm.auto import tqdm
 
 from configs.fontdiffuser import get_parser
@@ -109,6 +110,29 @@ def main():
             torch.load(f"{args.last_phase_ckpt_dir}/content_encoder.pth")
         )
 
+    # --- LoRA Implementation Start ---
+    print("Freezing base model and injecting LoRA Attention Processors...")
+    unet.requires_grad_(False)
+    style_encoder.requires_grad_(False)
+    content_encoder.requires_grad_(False)
+
+    lora_attn_procs = {}
+    for name in unet.attn_processors.keys():
+        cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+        if name.startswith("mid_block"):
+            hidden_size = unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = unet.config.block_out_channels[block_id]
+
+        lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+
+    unet.set_attn_processor(lora_attn_procs)
+    # --- LoRA Implementation End ---
+
     model = FontDiffuserModel(
         unet=unet,
         style_encoder=style_encoder,
@@ -192,8 +216,12 @@ def main():
             * args.train_batch_size
             * accelerator.num_processes
         )
+        
+    # ONLY OPTIMIZE PARAMETERS THAT REQUIRE GRADIENTS (The LoRA layers)
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -246,7 +274,6 @@ def main():
         )
 
     # Prepare progress bar
-    # Only show the progress bar once on each machine
     progress_bar = tqdm(
         initial=global_step,
         total=args.max_train_steps,
@@ -255,10 +282,6 @@ def main():
         position=0,
     )
 
-    # Compute training numbers (convert training steps to epochs, etc.)
-    # PyTorch: len(dataloader)/num_batches is the max number of batches that can fit into len(dataset)
-    # Accelerator: Gradient accum must fit into an epoch (and the final accum may have fewer steps)
-    # i.e. num_update_steps = ceil(num_batches / gradient_accumulation_steps)
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps
     )
@@ -285,8 +308,6 @@ def main():
         )
         timesteps = timesteps.long()
 
-        # Add noise to the target_images according to the noise magnitude at each timestep
-        # (this is the forward diffusion process)
         noisy_target_images = noise_scheduler.add_noise(target_images, noise, timesteps)
 
         # Classifier-free training strategy
@@ -323,23 +344,15 @@ def main():
             device=target_images.device,
         )
 
-        # We use a differentiable morphological gradient to approximate the character skeleton
         def extract_skeleton(img_tensor):
-            # Dilation (thickens the ink strokes) via Max Pooling
             dilated = F.max_pool2d(img_tensor, kernel_size=3, stride=1, padding=1)
-            # Erosion (thins the ink strokes) via negative Max Pooling
             eroded = -F.max_pool2d(-img_tensor, kernel_size=3, stride=1, padding=1)
-            # The difference isolates the structural skeleton/edges of the calligraphy
             return dilated - eroded
         
-        # Extract skeletons from both the generated prediction and the ground truth
         pred_skeleton = extract_skeleton(pred_original_sample)
         target_skeleton = extract_skeleton(nonorm_target_images)
         
-        # Calculate the L1 distance between the predicted bones and the real bones
         structural_loss = F.l1_loss(pred_skeleton, target_skeleton)
-        
-        # We use getattr in case you haven't added this argument to your config parser yet
         structural_coefficient = getattr(args, 'structural_coefficient', 0.5)
 
         loss = (
@@ -352,7 +365,6 @@ def main():
         if args.use_scr:
             assert scr is not None
             neg_images = samples["neg_images"]
-            # sc loss
             sample_style_embeddings, pos_style_embeddings, neg_style_embeddings = scr(
                 pred_original_sample_norm,
                 target_images,
@@ -369,10 +381,8 @@ def main():
         return loss
 
     def get_model(model):
-        # If the model is wrapped with DDP, we need to access the model with model.module
         if hasattr(model, "module"):
             return model.module
-        # If the model is not wrapped with DDP, we can access the model directly
         return model
 
     def get_submodel(model, submodule_name):
@@ -381,19 +391,16 @@ def main():
 
     # Training loop
     for epoch in range(num_train_epochs):
-        # Accumulated train loss in a global step, which may include multiple gradient accumulation steps
-        acc_train_loss = []  # distributed loss (average across all processes)
-        acc_local_train_loss = []  # local loss (only for the current process)
+        acc_train_loss = []  
+        acc_local_train_loss = []  
 
         for step, samples in enumerate(train_dataloader):
             # Training
             model.train()
             with accelerator.accumulate(model):
-                ## Forward pass
                 loss = compute_loss(samples)
                 acc_local_train_loss.append(loss.item())
 
-                ## Gather the losses across all processes
                 distributed_losses = accelerator.gather(
                     loss.repeat(args.train_batch_size)
                 )
@@ -401,7 +408,6 @@ def main():
                 distributed_loss = distributed_losses.mean()
                 acc_train_loss.append(distributed_loss.item())
 
-                ## Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -409,9 +415,7 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            is_on_global_step = (
-                accelerator.sync_gradients
-            )  # the accelerator has performed an optimization step behind the scenes
+            is_on_global_step = accelerator.sync_gradients
             is_on_main_process = accelerator.is_main_process
             process_idx = accelerator.process_index
 
@@ -421,7 +425,6 @@ def main():
                 logs = {"step_loss": distributed_loss.detach().item(), "lr": last_lr}
                 progress_bar.set_postfix(**logs)
 
-            # Update progress bar and global step states
             if is_on_global_step:
                 progress_bar.update(1)
                 global_step += 1
@@ -446,29 +449,23 @@ def main():
                     acc_local_train_loss
                 )
 
-                ## Log information to tensorboard
                 accelerator.log({"train_loss": avg_train_loss}, step=global_step)
 
-                ## Log information to file
                 if is_logging_step and is_on_main_process:
                     logging.info(
                         f"[{get_local_time()}] Global Step {global_step} => avg_train_loss = {avg_train_loss}"
                     )
 
-                ## Wait for everyone
                 accelerator.wait_for_everyone()
 
-                ## Log information to file for each process
                 if is_logging_step:
                     logging.info(
                         f"[{get_local_time()}] Proc {process_idx}: Global Step {global_step} => acc_local_train_loss = {acc_local_train_loss}"
                     )
 
-                ## Reset the accumulated loss states
                 acc_train_loss = []
                 acc_local_train_loss = []
 
-            # Wait for everyone
             accelerator.wait_for_everyone()
 
             # Save checkpoint
@@ -511,10 +508,8 @@ def main():
                         f"Computing validation loss on global step {global_step}"
                     )
 
-                ## Initialize validation loss states
                 all_val_losses: list[torch.Tensor] = []
 
-                ## Prepare validation progress bar
                 val_progress_bar = tqdm(
                     validation_dataloader,
                     total=num_validation_steps,
@@ -525,22 +520,18 @@ def main():
 
                 model.eval()
                 for val_step, val_samples in enumerate(val_progress_bar):
-                    ## Compute validation loss
                     with torch.no_grad():
                         val_loss = compute_loss(val_samples)
 
-                    ## Gather the losses across all processes
                     distributed_val_losses = accelerator.gather_for_metrics(val_loss)
                     assert isinstance(distributed_val_losses, torch.Tensor)
                     distributed_val_loss = distributed_val_losses.mean()
                     all_val_losses.append(distributed_val_loss)
 
-                    ## Log to validation progress bar
                     if is_on_main_process:
                         val_logs = {"val_loss": distributed_val_loss.detach().item()}
                         val_progress_bar.set_postfix(val_logs)
 
-                ## Compute and log validation loss values
                 if accelerator.is_main_process:
                     validation_loss = sum(all_val_losses) / len(all_val_losses)
                     progress_bar.write(f"Validation loss: {validation_loss}")
@@ -551,12 +542,10 @@ def main():
                         {"validation_loss": validation_loss}, step=global_step
                     )
 
-            # Quit
             if global_step >= args.max_train_steps:
                 break
 
     accelerator.end_training()
-
 
 if __name__ == "__main__":
     main()

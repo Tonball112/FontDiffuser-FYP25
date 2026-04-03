@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import torch
 from accelerate.utils import set_seed
+from diffusers.models.attention_processor import LoRAAttnProcessor # Added LoRA Import
 from PIL import Image
 
 from src import (
@@ -162,11 +163,35 @@ def image_process(
 def load_fontdiffuser_pipeline(args):
     # Load the model state_dict
     unet = build_unet(args=args)
-    unet.load_state_dict(torch.load(f"{args.ckpt_dir}/unet.pth"))
+
+    # --- LoRA Implementation Start ---
+    print("Injecting LoRA Attention Processors into UNet...")
+    lora_attn_procs = {}
+    for name in unet.attn_processors.keys():
+        cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+        if name.startswith("mid_block"):
+            hidden_size = unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = unet.config.block_out_channels[block_id]
+
+        lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+
+    unet.set_attn_processor(lora_attn_procs)
+    # --- LoRA Implementation End ---
+
+    # Bulletproofed torch.load with map_location='cpu'
+    unet.load_state_dict(torch.load(f"{args.ckpt_dir}/unet.pth", map_location='cpu'))
+    
     style_encoder = build_style_encoder(args=args)
-    style_encoder.load_state_dict(torch.load(f"{args.ckpt_dir}/style_encoder.pth"))
+    style_encoder.load_state_dict(torch.load(f"{args.ckpt_dir}/style_encoder.pth", map_location='cpu'))
+    
     content_encoder = build_content_encoder(args=args)
-    content_encoder.load_state_dict(torch.load(f"{args.ckpt_dir}/content_encoder.pth"))
+    content_encoder.load_state_dict(torch.load(f"{args.ckpt_dir}/content_encoder.pth", map_location='cpu'))
+    
     model = FontDiffuserModelDPM(
         unet=unet, style_encoder=style_encoder, content_encoder=content_encoder
     )
