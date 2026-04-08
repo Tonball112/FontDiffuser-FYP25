@@ -14,7 +14,6 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from diffusers.optimization import get_scheduler
-from diffusers.models.attention_processor import LoRAAttnProcessor # Added LoRA Import
 from tqdm.auto import tqdm
 
 from configs.fontdiffuser import get_parser
@@ -111,26 +110,21 @@ def main():
         )
 
     # --- LoRA Implementation Start ---
-    print("Freezing base model and injecting LoRA Attention Processors...")
+    from peft import LoraConfig, get_peft_model
+    
+    print("Freezing base model and injecting LoRA using PEFT...")
     unet.requires_grad_(False)
     style_encoder.requires_grad_(False)
     content_encoder.requires_grad_(False)
 
-    lora_attn_procs = {}
-    for name in unet.attn_processors.keys():
-        cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
-        if name.startswith("mid_block"):
-            hidden_size = unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = unet.config.block_out_channels[block_id]
-
-        lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
-
-    unet.set_attn_processor(lora_attn_procs)
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        target_modules=["to_q", "to_k", "to_v", "to_out.0"], 
+    )
+    unet = get_peft_model(unet, lora_config)
+    
+    unet.print_trainable_parameters() 
     # --- LoRA Implementation End ---
 
     model = FontDiffuserModel(
