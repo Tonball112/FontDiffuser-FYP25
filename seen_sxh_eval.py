@@ -63,7 +63,7 @@ def main():
     toTensor = TF.ToTensor()
     
     # Target characters
-    characters = ['帝', '己', '典', '假']
+    characters = ['帝', '不', '典', '丈']
     
     # Paths based on your descriptions and zs_sxh_eval.py
     content_dir = "data_sxh/train/ContentImage"
