@@ -4,11 +4,11 @@ import torch.nn.functional as F
 import torchvision.transforms as TF
 from PIL import Image
 
-# Standard FontDiffuser imports
 from sample import arg_parse, load_fontdiffuser_pipeline, sampling
 from src.metrics.font_metrics import FontMetrics
 
 def calculate_structural_metrics(pred_tensor, target_tensor):
+    # 1. Morphological Skeleton L1
     def extract_skeleton(img_tensor):
         dilated = F.max_pool2d(img_tensor, kernel_size=3, stride=1, padding=1)
         eroded = -F.max_pool2d(-img_tensor, kernel_size=3, stride=1, padding=1)
@@ -18,6 +18,7 @@ def calculate_structural_metrics(pred_tensor, target_tensor):
     target_skel = extract_skeleton(target_tensor)
     skel_l1 = F.l1_loss(pred_skel, target_skel).item()
 
+    # 2. Skeleton IoU (Intersection over Union)
     threshold = 0.1
     pred_bin = (pred_skel > threshold).float()
     targ_bin = (target_skel > threshold).float()
@@ -25,11 +26,12 @@ def calculate_structural_metrics(pred_tensor, target_tensor):
     union = pred_bin.sum() + targ_bin.sum() - intersection
     skel_iou = (intersection / union).item() if union > 0 else 1.0
 
+    # 3. Sobel Edge Loss
     pred_gray = pred_tensor.mean(dim=1, keepdim=True)
     targ_gray = target_tensor.mean(dim=1, keepdim=True)
     
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3).to(pred_tensor.device)
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3).to(pred_tensor.device)
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=pred_tensor.device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=pred_tensor.device).view(1, 1, 3, 3)
     
     pred_edge_x = F.conv2d(pred_gray, sobel_x, padding=1)
     pred_edge_y = F.conv2d(pred_gray, sobel_y, padding=1)
@@ -40,58 +42,70 @@ def calculate_structural_metrics(pred_tensor, target_tensor):
     targ_edge = torch.sqrt(targ_edge_x**2 + targ_edge_y**2 + 1e-6)
     
     edge_l1 = F.l1_loss(pred_edge, targ_edge).item()
+    
     return skel_l1, skel_iou, edge_l1
 
 def main():
     args = arg_parse()
-    pipeline = load_fontdiffuser_pipeline(args)
     
-    # The 4 seen characters for your balanced comparison
+    # --- CONFIGURATION (Matching your zero-shot settings) ---
+    args.guidance_type = "classifier-free"
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.guidance_scale = 7.5
+    args.method = "multistep"
+    args.algorithm_type = "dpmsolver++"
+    args.demo = True
+    args.num_inference_steps = 20
+    args.batch_size = 1
+    args.seed = 1234 
+    
+    pipe = load_fontdiffuser_pipeline(args=args)
+    toTensor = TF.ToTensor()
+    
+    # Target characters
     characters = ['帝', '己', '典', '假']
     
-    # Exact paths based on your configuration 
-    CONTENT_DIR = "data_sxh/train/ContentImage"
-    STYLE_IMAGE_PATH = "data_sxh/train/TargetImage/sxh/sxh+中.png" 
-    GT_DIR = "data_sxh/seen_ground_truth"
+    # Paths based on your descriptions and zs_sxh_eval.py
+    content_dir = "data_sxh/train/ContentImage"
+    gt_dir = "data_sxh/seen_ground_truth" 
+    style_image_path = "data_sxh/train/TargetImage/sxh/sxh+中.png" # Updated to match the style image you requested
+    
+    style_image = Image.open(style_image_path).convert("RGB")
+
+    print("\n=== STARTING BALANCED SEEN EVALUATION (4 vs 4) ===")
     
     results = {}
-    transform = TF.Compose([
-        TF.Resize((128, 128)),
-        TF.ToTensor(),
-        TF.Normalize([0.5], [0.5])
-    ])
-    
-    print("=== STARTING BALANCED SEEN EVALUATION (4 vs 4) ===")
-    style_image = Image.open(STYLE_IMAGE_PATH).convert("RGB")
     
     for char in characters:
-        print(f"\nProcessing Seen Character: {char}")
+        print(f"\nEvaluating: {char}")
         
-        content_path = os.path.join(CONTENT_DIR, f"{char}.png")
-        gt_path = os.path.join(GT_DIR, f"{char}.png")
+        content_path = f"{content_dir}/{char}.png"
+        gt_path = f"{gt_dir}/{char}.png"
         
         if not os.path.exists(gt_path):
-            print(f"  Error: Ground truth not found at {gt_path}")
+            print(f"[ERROR] Ground truth not found at {gt_path}. Skipping {char}!")
             continue
 
-        content_image = Image.open(content_path).convert("RGB")
+        content_img = Image.open(content_path).convert("RGB")
+        
+        # Exact sampling call used in zs_sxh_eval.py
+        sampling_args = dict(args=args, pipe=pipe, content_image=content_img, style_image=style_image)
+        out_image = sampling(**sampling_args)
+            
         gt_image = Image.open(gt_path).convert("RGB")
+        if gt_image.size != (96, 96):
+            gt_image = gt_image.resize((96, 96), Image.Resampling.BILINEAR)
+            
+        # FontMetrics logic matching zs_sxh_eval.py
+        char_metrics = FontMetrics(device=args.device)
+        pred_tensor = torch.stack([toTensor(out_image)]).to(args.device)
+        gt_tensor = torch.stack([toTensor(gt_image)]).to(args.device)
         
-        # Sampling with LoRA injected 
-        pred_image = sampling(
-            args=args,
-            pipeline=pipeline,
-            content_image=content_image,
-            style_image=style_image
-        )
-        
-        pred_tensor = transform(pred_image).unsqueeze(0).to(args.device)
-        gt_tensor = transform(gt_image).unsqueeze(0).to(args.device)
-        
-        # Compute metrics 
-        char_metrics = FontMetrics(gt_tensor, pred_tensor)
+        char_metrics.update(pred_tensor, gt_tensor)
         scores = char_metrics.compute()
-        skel_l1, skel_iou, edge_l1 = calculate_structural_metrics(pred_tensor, gt_tensor)
+        
+        with torch.no_grad():
+            skel_l1, skel_iou, edge_l1 = calculate_structural_metrics(pred_tensor, gt_tensor)
             
         results[char] = {
             "SSIM": scores["ssim"],
@@ -101,20 +115,26 @@ def main():
             "L1_Edge": edge_l1
         }
         
-    # Print Balanced Summary
+        print(f"  SSIM: {scores['ssim']:.4f} | Skel L1(↓): {skel_l1:.4f} | Skel IoU(↑): {skel_iou:.4f} | Edge L1(↓): {edge_l1:.4f}")
+
     print("\n=== BALANCED SEEN SUMMARY (4 CHARACTERS) ===")
     print(f"{'Char':<6} | {'SSIM (↑)':<10} | {'L1 Pix(↓)':<10} | {'Skel L1(↓)':<12} | {'Skel IoU(↑)':<12} | {'Edge L1(↓)':<12}")
     print("-" * 75)
     
-    metrics_sums = [0.0] * 5
+    avg_ssim, avg_l1, avg_skel, avg_iou, avg_edge = 0, 0, 0, 0, 0
+    count = len(results)
+    
     for char, mets in results.items():
-        vals = [mets['SSIM'], mets['L1_Pixel'], mets['L1_Skeleton'], mets['IoU_Skeleton'], mets['L1_Edge']]
-        print(f"{char:<6} | {vals[0]:<10.4f} | {vals[1]:<10.4f} | {vals[2]:<12.4f} | {vals[3]:<12.4f} | {vals[4]:<12.4f}")
-        for i in range(5): metrics_sums[i] += vals[i]
+        print(f"{char:<6} | {mets['SSIM']:<10.4f} | {mets['L1_Pixel']:<10.4f} | {mets['L1_Skeleton']:<12.4f} | {mets['IoU_Skeleton']:<12.4f} | {mets['L1_Edge']:<12.4f}")
+        avg_ssim += mets['SSIM']
+        avg_l1 += mets['L1_Pixel']
+        avg_skel += mets['L1_Skeleton']
+        avg_iou += mets['IoU_Skeleton']
+        avg_edge += mets['L1_Edge']
         
-    avg = [v/len(results) for v in metrics_sums]
-    print("-" * 75)
-    print(f"{'AVG':<6} | {avg[0]:<10.4f} | {avg[1]:<10.4f} | {avg[2]:<12.4f} | {avg[3]:<12.4f} | {avg[4]:<12.4f}")
+    if count > 0:
+        print("-" * 75)
+        print(f"{'AVG':<6} | {avg_ssim/count:<10.4f} | {avg_l1/count:<10.4f} | {avg_skel/count:<12.4f} | {avg_iou/count:<12.4f} | {avg_edge/count:<12.4f}")
 
 if __name__ == "__main__":
     main()
