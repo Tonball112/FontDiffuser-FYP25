@@ -44,7 +44,7 @@ def calculate_structural_metrics(pred_tensor, target_tensor):
 
 def main():
     args = arg_parse()
-    pipeline, model_params = load_fontdiffuser_pipeline(args)
+    pipeline = load_fontdiffuser_pipeline(args)
     
     # The 4 seen characters for your balanced comparison
     characters = ['帝', '己', '典', '假']
@@ -82,8 +82,7 @@ def main():
             args=args,
             pipeline=pipeline,
             content_image=content_image,
-            style_image=style_image,
-            model_params=model_params
+            style_image=style_image
         )
         
         pred_tensor = transform(pred_image).unsqueeze(0).to(args.device)
