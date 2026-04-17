@@ -50,7 +50,7 @@ def main():
     characters = ['帝', '己', '典', '假']
     
     # Exact paths based on your configuration 
-    CONTENT_DIR = "data_sxh/train/ContentImage/standard"
+    CONTENT_DIR = "data_sxh/train/ContentImage"
     STYLE_IMAGE_PATH = "data_sxh/train/TargetImage/sxh/sxh+中.png" 
     GT_DIR = "data_sxh/seen_ground_truth"
     
