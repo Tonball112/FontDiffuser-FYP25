@@ -51,7 +51,7 @@ def main():
     
     # Exact paths based on your configuration 
     CONTENT_DIR = "data_sxh/train/ContentImage/standard"
-    STYLE_IMAGE_PATH = "data_sxh/train/StyleImage/sxh/sxh+中.png" 
+    STYLE_IMAGE_PATH = "data_sxh/train/TargetImage/sxh/sxh+中.png" 
     GT_DIR = "data_sxh/seen_ground_truth"
     
     results = {}
